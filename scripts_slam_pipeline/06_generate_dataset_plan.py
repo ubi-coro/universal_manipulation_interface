@@ -296,8 +296,18 @@ def main(input, output, tcp_offset, tx_slam_tag,
         n_frames = len(tag_data)
         tag_counts = collections.defaultdict(lambda: 0)
         for frame in tag_data:
+            # If 'tag_dict' is empty for this frame, skip it.
+            if not frame.get('tag_dict', {}):
+                continue
             for key in frame['tag_dict'].keys():
                 tag_counts[key] += 1
+
+        # If no tags were ever detected, mark as no gripper.
+        if len(tag_counts) == 0:
+            print(f"Warning: {video_dir.name} contains tag_detection data but no ArUco tags were detected. Marking as no gripper.")
+            vid_idx_gripper_hardware_id_map[vid_idx] = None
+            continue
+
         tag_stats = collections.defaultdict(lambda: 0.0)
         for k, v in tag_counts.items():
             tag_stats[k] = v / n_frames
@@ -570,7 +580,7 @@ def main(input, output, tcp_offset, tx_slam_tag,
         # load pose and gripper data for each video
         # determin valid frames for each video
         all_cam_poses = list()
-        all_gripper_widths = list()
+        all_gripper_widths = list()  # Will store None if no gripper actions are available.
         all_is_valid = list()
         
         for cam_idx, row in demo_video_meta_df.iterrows():
@@ -640,56 +650,64 @@ def main(input, output, tcp_offset, tx_slam_tag,
             # select aligned frames
             tag_detection_results = tag_detection_results[start_frame_idx: start_frame_idx+n_frames]
 
-            # one item per frame
-            video_timestamps = np.array([x['time'] for x in tag_detection_results])
-
-            if len(df) != len(video_timestamps):
-                print(f"Skipping {video_dir.name}, video csv length mismatch.")
-                continue
-
-            # get gripper action
-            ghi = row['gripper_hardware_id']
-            if ghi < 0:
-                print(f"Skipping {video_dir.name}, invalid gripper hardware id {ghi}")
-                dropped_camera_count[row['camera_serial']] += 1
-                continue
-            
-            left_id = 6 * ghi
-            right_id = left_id + 1
-
-            gripper_cal_interp = None
-            if ghi in gripper_id_gripper_cal_map:
-                gripper_cal_interp = gripper_id_gripper_cal_map[ghi]
-            elif row['camera_serial'] in cam_serial_gripper_cal_map:
-                gripper_cal_interp = cam_serial_gripper_cal_map[row['camera_serial']]
-                print(f"Gripper id {ghi} not found in gripper calibrations {list(gripper_id_gripper_cal_map.keys())}. Falling back to camera serial map.")
+            # Check if for every frame, 'tag_dict' is empty.
+            if not any(td.get('tag_dict', {}) for td in tag_detection_results):
+                print(f"{video_dir.name} has tag_detection data with empty tag_dicts. Setting gripper actions to None.")
+                this_gripper_widths = None
             else:
-                raise RuntimeError("Gripper calibration not found.")
+                # one item per frame
+                video_timestamps = np.array([x['time'] for x in tag_detection_results])
 
-            gripper_timestamps = list()
-            gripper_widths = list()
-            for td in tag_detection_results:
-                width = get_gripper_width(td['tag_dict'], 
-                    left_id=left_id, right_id=right_id, 
-                    nominal_z=nominal_z)
-                if width is not None:
-                    gripper_timestamps.append(td['time'])
-                    gripper_widths.append(gripper_cal_interp(width))
-            gripper_interp = get_interp1d(gripper_timestamps, gripper_widths)
-            
-            gripper_det_ratio = (len(gripper_widths) / len(tag_detection_results))
-            if gripper_det_ratio < 0.9:
-                print(f"Warining: {video_dir.name} only {gripper_det_ratio} of gripper tags detected.")
-            
-            this_gripper_widths = gripper_interp(video_timestamps)
+                if len(df) != len(video_timestamps):
+                    print(f"Skipping {video_dir.name}, video csv length mismatch.")
+                    continue
+
+                # get gripper action
+                ghi = row['gripper_hardware_id']
+                if ghi < 0:
+                    print(f"Skipping {video_dir.name}, invalid gripper hardware id {ghi}")
+                    dropped_camera_count[row['camera_serial']] += 1
+                    continue
+
+                left_id = 6 * ghi
+                right_id = left_id + 1
+
+                gripper_cal_interp = None
+                if ghi in gripper_id_gripper_cal_map:
+                    gripper_cal_interp = gripper_id_gripper_cal_map[ghi]
+                elif row['camera_serial'] in cam_serial_gripper_cal_map:
+                    gripper_cal_interp = cam_serial_gripper_cal_map[row['camera_serial']]
+                    print(f"Gripper id {ghi} not found in gripper calibrations {list(gripper_id_gripper_cal_map.keys())}. Falling back to camera serial map.")
+                else:
+                    raise RuntimeError("Gripper calibration not found.")
+
+                gripper_timestamps = list()
+                gripper_widths = list()
+                for td in tag_detection_results:
+                    width = get_gripper_width(td['tag_dict'],
+                        left_id=left_id, right_id=right_id,
+                        nominal_z=nominal_z)
+                    if width is not None:
+                        gripper_timestamps.append(td['time'])
+                        gripper_widths.append(gripper_cal_interp(width))
+                gripper_interp = get_interp1d(gripper_timestamps, gripper_widths)
+
+                gripper_det_ratio = (len(gripper_widths) / len(tag_detection_results))
+                if gripper_det_ratio < 0.9:
+                    print(f"Warining: {video_dir.name} only {gripper_det_ratio} of gripper tags detected.")
+
+                this_gripper_widths = gripper_interp(video_timestamps)
             
             # transform to tcp frame
             tx_tag_tcp = tx_tag_cam @ tx_cam_tcp
             pose_tag_tcp = mat_to_pose(tx_tag_tcp)
             
             # output value
-            assert len(pose_tag_tcp) == n_frames
-            assert len(this_gripper_widths) == n_frames
+            if this_gripper_widths is not None:
+                assert len(pose_tag_tcp) == n_frames
+                assert len(this_gripper_widths) == n_frames
+            else:
+                assert len(pose_tag_tcp) == n_frames
             assert len(is_step_valid) == n_frames
             all_cam_poses.append(pose_tag_tcp)
             all_gripper_widths.append(this_gripper_widths)
@@ -740,11 +758,16 @@ def main(input, output, tcp_offset, tx_slam_tag,
             for cam_idx, row in demo_video_meta_df.iterrows():
                 if cam_idx < n_gripper_cams:
                     pose_tag_tcp = all_cam_poses[cam_idx][start:end]
+
+                    if all_gripper_widths[cam_idx] is not None:
+                        gw = all_gripper_widths[cam_idx][start:end]
+                    else:
+                        gw = None
                     
                     # gripper cam
                     grippers.append({
                         "tcp_pose": pose_tag_tcp,
-                        "gripper_width": all_gripper_widths[cam_idx][start:end],
+                        "gripper_width": gw,
                         "demo_start_pose": demo_start_poses[cam_idx],
                         "demo_end_pose": demo_end_poses[cam_idx]
                     })
